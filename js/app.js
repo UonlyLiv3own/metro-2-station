@@ -25,7 +25,8 @@ const statuses = [
 const teams = ["Tổ 1", "Tổ 2"];
 const dayMs = 86400000;
 const page = document.body.dataset.page;
-const params = new URLSearchParams(location.search);
+const live = window.METRO_LIVE || null;
+const params = new URLSearchParams(live?.params || location.search);
 const demo = params.get("demo") === "1";
 const moneyFormat = new Intl.NumberFormat("vi-VN");
 const compactFormat = new Intl.NumberFormat("vi-VN", {
@@ -71,6 +72,10 @@ function statusOf(raw) {
   const key = normalize(raw)
     .replace(/^\d+\.\s*/, "")
     .replace(/\s*\/\s*/g, "/");
+  const stageIndex = { 0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5 }[
+    /^(\d+)\./.exec(raw ?? "")?.[1]
+  ];
+  if (stageIndex !== undefined) return statuses[stageIndex];
   return (
     statuses.find(
       (label) => normalize(label).replace(/\s*\/\s*/g, "/") === key,
@@ -120,6 +125,7 @@ function demoRecords() {
       enforcement: i % 19 === 0 ? "CC-MP-" + id : null,
       note: i % 11 === 0 ? "Vướng mắc minh họa" : null,
       handover: i < 24 ? "Đã bàn giao" : null,
+      handoverDate: i < 24 ? isoDay(Date.parse(today) - i * 4 * dayMs) : null,
       groups,
     };
   });
@@ -132,6 +138,9 @@ const rows = (demo ? demoRecords() : window.METRO_RECORDS).map((record) => ({
     .filter(Boolean)
     .join(", "),
   paid: sum(record.groups, (group) => group[1]),
+  hasPaid: record.paymentEntries
+    ? record.paymentEntries.some((entry) => entry.amount > 0)
+    : record.groups.some((group) => group[1] > 0),
 }));
 
 function href(target, extra = {}) {
@@ -139,6 +148,10 @@ function href(target, extra = {}) {
     ...(demo ? { demo: "1" } : {}),
     ...extra,
   });
+  if (live) {
+    query.set("page", target);
+    return live.url + "?" + query;
+  }
   return target + ".html" + (query.size ? "?" + query : "");
 }
 
@@ -205,10 +218,13 @@ function overview() {
   const tasks = [
     ["Thông báo thu hồi đất", (r) => r.notice],
     ["Phê duyệt phương án", (r) => r.approval],
-    ["Giải chi", (r) => r.paid > 0],
+    ["Giải chi", (r) => r.hasPaid],
     [
       "Bàn giao mặt bằng",
-      (r) => normalize(r.handover).replace(/^\d+\.\s*/, "") === "da ban giao",
+      (r) =>
+        live && !demo
+          ? Boolean(r.handoverDate && r.handoverDate <= today)
+          : normalize(r.handover).replace(/^\d+\.\s*/, "") === "da ban giao",
     ],
   ];
   return (
@@ -237,12 +253,12 @@ function overview() {
       "Danh sách hồ sơ chưa chi",
       teams
         .map((team) => {
-          const items = rows.filter((r) => r.team === team && r.paid <= 0);
+          const items = rows.filter((r) => r.team === team && !r.hasPaid);
           return `<h3>${team} · ${items.length} hồ sơ</h3>${recordsTable(items.slice(0, 15))}`;
         })
         .join(""),
       "Hiển thị tối đa 15 hồ sơ mỗi tổ.",
-      `<a class="button" href="${href("btgpmb")}#unpaid">Xem danh sách</a>`,
+      `<a class="button" href="${href("btgpmb", live ? { anchor: "unpaid" } : {})}${live ? "" : "#unpaid"}">Xem danh sách</a>`,
     )
   );
 }
@@ -326,7 +342,7 @@ function setupList() {
     lists.innerHTML = ["paid", "unpaid"]
       .map((key) => {
         const items = matches.filter((r) =>
-          key === "paid" ? r.paid > 0 : r.paid <= 0,
+          key === "paid" ? r.hasPaid : !r.hasPaid,
         );
         const last = Math.max(0, Math.ceil(items.length / size) - 1);
         pages[key] = Math.min(last, pages[key]);
@@ -360,23 +376,18 @@ function setupList() {
       .scrollIntoView({ block: "nearest" });
   });
   update();
-  if (["#paid", "#unpaid"].includes(location.hash))
-    document.getElementById(location.hash.slice(1)).scrollIntoView();
+  const anchor = params.get("anchor") || location.hash.slice(1);
+  if (["paid", "unpaid"].includes(anchor))
+    document.getElementById(anchor).scrollIntoView();
 }
 
 const payments = rows.flatMap((record) =>
-  record.groups.flatMap((group, index) =>
-    group[1] > 0
-      ? [
-          {
-            id: record.id,
-            group: index,
-            amount: group[1],
-            date: /^\d{4}-\d{2}-\d{2}$/.test(group[3] || "") ? group[3] : null,
-          },
-        ]
-      : [],
-  ),
+  (
+    record.paymentEntries ||
+    record.groups.flatMap((group, index) =>
+      group[1] > 0 ? [{ group: index, amount: group[1], date: group[3] }] : [],
+    )
+  ).map((entry) => ({ ...entry, id: record.id })),
 );
 const start = isoDay(Date.parse(today) - 6 * dayMs);
 const week = payments.filter((p) => p.date >= start && p.date <= today);
@@ -414,7 +425,22 @@ function finance() {
   const groupRates = groupNames
     .map((g, i) => progress(g, ratio(measure(rows, 1, i), measure(rows, 0, i))))
     .join("");
-  return `<div class="grid four">${cashKpis(rows)}${kpi("Tỷ lệ giải chi", percent(ratio(measure(rows, 1, 0) + measure(rows, 1, 2), measure(rows, 0))), "", "blue", "Bồi thường và thưởng BGMB có cột dự toán")}</div>
+  return `<div class="grid four">${cashKpis(rows)}${kpi(
+    "Tỷ lệ giải chi",
+    percent(
+      ratio(
+        groupNames.reduce(
+          (total, _, i) =>
+            total + (measure(rows, 0, i) > 0 ? (measure(rows, 1, i) ?? 0) : 0),
+          0,
+        ),
+        measure(rows, 0),
+      ),
+    ),
+    "",
+    "blue",
+    "Theo các nhóm có dự toán dương",
+  )}</div>
   <div class="finance-grid">${panel("Lịch giải ngân 7 ngày gần nhất", weekly + datedNote(), `${dateLabel(start)} – ${dateLabel(today)} · ${uniqueCases(week)} hồ sơ trong kỳ · Mỗi chỉ tiêu dùng thang riêng.`)}
   ${panel("Tỷ lệ giải ngân các nhóm chi", groupRates, "Đã chi / Dự toán. Dấu — hiển thị khi thiếu dự toán hoặc dự toán bằng 0.")}</div>`;
 }
@@ -429,8 +455,10 @@ function detail() {
   const from =
     params.get("from") === "overview"
       ? href("overview")
-      : href("btgpmb", { restore: "1" }) +
-        (record.paid > 0 ? "#paid" : "#unpaid");
+      : href("btgpmb", {
+          restore: "1",
+          ...(live ? { anchor: record.hasPaid ? "paid" : "unpaid" } : {}),
+        }) + (live ? "" : record.hasPaid ? "#paid" : "#unpaid");
   const fields = [
     ["Tổ công tác", record.team],
     ["Phường", record.ward],
@@ -446,10 +474,18 @@ function detail() {
     ["Thông báo thu hồi đất", record.notice],
     ["QĐ phê duyệt phương án", record.approval],
     ["QĐ thu hồi đất", record.recovery],
+    ["Phương án bổ sung", record.supplementPlan],
+    ["QĐ phê duyệt điều chỉnh", record.supplementApproval],
     ["QĐ cưỡng chế", record.enforcement],
     ["QĐ chi tiền tạm cư", record.temporaryDecision],
     ["Bàn giao mặt bằng", record.handover],
+    [
+      "Ngày bàn giao mặt bằng",
+      record.handoverDate ? dateLabel(record.handoverDate) : null,
+    ],
     ["Trạng thái hồ sơ", record.stage],
+    ["Trạng thái PACT", record.pact],
+    ["Ý kiến hộ dân khi giải chi", record.opinion],
   ];
   return (
     panel(
@@ -472,7 +508,7 @@ function detail() {
         record.groups
           .map(
             (g, i) =>
-              `<tr><td>${groupNames[i]}</td><td>${money(g[0])}</td><td>${money(g[1])}</td><td>${money(g[2])}</td><td>${progress("", ratio(g[1], g[0]))}</td><td>${value(record.note)}</td></tr>`,
+              `<tr><td>${groupNames[i]}${record.budgetDecisions?.[i] ? `<small class="sub">${value(record.budgetDecisions[i])}</small>` : ""}</td><td>${money(g[0])}</td><td>${money(g[1])}</td><td>${money(g[2])}</td><td>${progress("", ratio(g[1], g[0]))}</td><td>${value(record.note)}</td></tr>`,
           )
           .join(""),
       ),
@@ -481,8 +517,15 @@ function detail() {
   );
 }
 
+function hasDecision(value) {
+  return (
+    Boolean(String(value ?? "").trim()) &&
+    !/^(0|[-–—])$/.test(String(value).trim())
+  );
+}
+
 function report() {
-  const paid = rows.filter((r) => r.paid > 0).length;
+  const paid = rows.filter((r) => r.hasPaid).length;
   const date = new Date(today + "T00:00:00Z");
   const months = Array.from({ length: 6 }, (_, i) => {
     const month = new Date(
@@ -494,11 +537,21 @@ function report() {
     );
     const fullyPaid = rows.filter((r) => {
       const estimate = measure([r], 0);
-      const balance = measure([r], 2);
+      const complete = r.groups.every(([planned, paid], i) => {
+        const applies =
+          (planned ?? 0) > 0 ||
+          (paid ?? 0) > 0 ||
+          (i === 3 && hasDecision(r.temporaryDecision));
+        return !applies || (planned > 0 && paid >= planned);
+      });
       const dates = payments.filter((p) => p.id === r.id);
       return (
+        (!live ||
+          demo ||
+          (!live.payload.pendingHeaders.length &&
+            !live.payload.invalidAmounts.length)) &&
         estimate > 0 &&
-        balance === 0 &&
+        complete &&
         dates.length &&
         dates.every((p) => p.date && p.date <= today) &&
         dates
@@ -510,7 +563,13 @@ function report() {
     });
     return {
       label: prefix.slice(5) + "/" + prefix.slice(0, 4),
-      data: [fullyPaid.length, sum(entries, (p) => p.amount)],
+      data: [
+        fullyPaid.length,
+        rows.filter(
+          (r) => r.handoverDate?.startsWith(prefix) && r.handoverDate <= today,
+        ).length,
+        sum(entries, (p) => p.amount),
+      ],
     };
   });
   const financial = [0, 1, 2];
@@ -550,7 +609,7 @@ function report() {
     })
     .join("");
   return (
-    `<section class="report-cover panel"><p>BÁO CÁO TÌNH HÌNH CHI TIỀN GIẢI PHÓNG MẶT BẰNG</p><h2>Dự án Đường sắt đô thị · Ga Metro 2</h2><p>Kỳ hiển thị 7 ngày · ${dateLabel(start)} – ${dateLabel(today)}</p>${demo ? "<p>DỮ LIỆU MÔ PHỎNG</p>" : "<p>Dữ liệu tạm từ Excel</p>"}</section>
+    `<section class="report-cover panel"><p>BÁO CÁO TÌNH HÌNH CHI TIỀN GIẢI PHÓNG MẶT BẰNG</p><h2>Dự án Đường sắt đô thị · Ga Metro 2</h2><p>Kỳ hiển thị 7 ngày · ${dateLabel(start)} – ${dateLabel(today)}</p>${demo ? "<p>DỮ LIỆU MÔ PHỎNG</p>" : live ? "<p>Nguồn DỮ LIỆU TỔNG HỢP</p>" : "<p>Dữ liệu tạm từ Excel</p>"}</section>
     <div class="grid three">${kpi("Tổng số hồ sơ", rows.length, "hồ sơ")}${kpi("Hồ sơ đã chi", paid, "hồ sơ", "teal")}${kpi("Hồ sơ chưa chi", rows.length - paid, "hồ sơ", "orange")}</div>
     <div class="grid three spaced">${cashKpis(rows)}</div>` +
     panel(
@@ -561,9 +620,14 @@ function report() {
           tone: "teal",
           format: moneyFormat.format,
         },
+        {
+          label: "Hồ sơ hoàn tất bàn giao mặt bằng",
+          tone: "orange",
+          format: moneyFormat.format,
+        },
         { label: "Đã chi (tỷ đồng)", tone: "purple", format: compact },
       ]) + datedNote(),
-      "6 tháng đến ngày hiển thị. Hồ sơ hoàn tất khi có dự toán, số còn chi bằng 0 và xác định được ngày chi cuối. Mỗi chỉ tiêu dùng thang riêng.",
+      "6 tháng đến ngày hiển thị. Hoàn tất chi khi đủ các nhóm áp dụng và có ngày chi cuối. Hoàn tất bàn giao theo ngày bàn giao. Mỗi chỉ tiêu dùng thang riêng.",
     ) +
     panel(
       "Giải ngân theo nhóm",
@@ -577,7 +641,7 @@ function report() {
     ) +
     panel(
       "Nội dung cần theo dõi",
-      `<div class="grid three">${kpi("Hồ sơ vướng mắc", rows.filter((r) => normalize(r.note).includes("vuong mac")).length, "hồ sơ", "orange", "Theo ghi chú chứa “vướng mắc”")}${kpi("Hồ sơ cưỡng chế", rows.filter((r) => r.enforcement && !["0", "-", "—"].includes(String(r.enforcement).trim())).length, "hồ sơ", "red", "Theo số quyết định cưỡng chế")}${kpi("Hồ sơ ngăn chặn", rows.filter((r) => r.stage === statuses[6]).length, "hồ sơ", "blue", "Theo trạng thái hồ sơ")}</div>`,
+      `<div class="grid three">${kpi("Hồ sơ vướng mắc", rows.filter((r) => normalize(r.status).includes("vuong mac") || /vuong mac|tranh chap|the chap/.test(normalize(r.pact)) || (demo && normalize(r.note).includes("vuong mac"))).length, "hồ sơ", "orange", "Theo trạng thái hồ sơ hoặc PACT")}${kpi("Hồ sơ cưỡng chế", rows.filter((r) => hasDecision(r.enforcement)).length, "hồ sơ", "red", "Theo số quyết định cưỡng chế")}${kpi("Hồ sơ ngăn chặn", rows.filter((r) => /^(?:\d+\.\s*)?ngan chan$/.test(normalize(r.pact)) || (demo && r.stage === statuses[6])).length, "hồ sơ", "blue", "Theo trạng thái PACT")}</div>`,
     )
   );
 }
@@ -590,20 +654,24 @@ const titles = {
   detail: "Thông tin pháp lý và chi trả",
   report: "Tổng hợp số liệu phục vụ báo cáo",
 };
-const toggleParams = new URLSearchParams();
-if (!demo) toggleParams.set("demo", "1");
-const toggle = page + ".html" + (toggleParams.size ? "?" + toggleParams : "");
+const toggle = href(page, { demo: demo ? "0" : "1" });
+const homeUrl = live ? live.url : "../index.html";
+const logo = live ? live.logo : "../assets/metro-reference.png";
+const sourceLabel = live
+  ? "Dữ liệu trực tiếp từ Google Sheets"
+  : "Dữ liệu tạm từ Excel";
+const pending = live?.payload?.pendingHeaders || [];
+const invalid = live?.payload?.invalidAmounts || [];
+const dataNotes =
+  !demo && (pending.length || invalid.length)
+    ? `<div class="data-banner demo">
+  ${pending.length ? `<span>Chưa có các cột ${pending.map(escape).join(", ")}. Chỉ tiêu hoàn tất chi chờ đủ cấu trúc nguồn.</span>` : ""}
+  ${invalid.length ? `<span>Có ô tiền đang nhập dạng chữ tại ${invalid.map(escape).join(", ")}.</span>` : ""}
+</div>`
+    : "";
 document.querySelector("#app").innerHTML = `
   <aside class="sidebar">
-    <a class="brand brand-metro" href="../index.html">
-      <span class="brand-icon" aria-hidden="true">
-        <i class="fa-solid fa-train-subway"></i>
-      </span>
-      <span>
-        <strong>Đường Sắt Đô Thị</strong>
-        <small>Ga Metro 2</small>
-      </span>
-    </a>
+    <a class="brand" href="${homeUrl}"><img src="${logo}" alt="Metro No.2 · Dashboard quản lý GPMB"></a>
     <nav aria-label="Điều hướng chính">${Object.entries(pages)
       .map(
         ([key, label], i) =>
@@ -612,11 +680,11 @@ document.querySelector("#app").innerHTML = `
       .join("")}</nav>
     <div class="sidebar-footer">DỰ ÁN GA METRO 2</div>
   </aside>
-  <main><div class="topbar"><a href="../index.html">Trang chủ</a><span>/</span><span>${pages[page]}</span></div>
+  <main><div class="topbar"><a href="${homeUrl}">Trang chủ</a><span>/</span><span>${pages[page]}</span></div>
     <div class="content"><header class="page-head"><div><p class="subtitle">${titles[page]}</p><h1>${pages[page]}</h1></div>
-    <div class="head-actions">${page === "report" ? '<button class="button" id="print">In / Lưu PDF</button>' : ""}<a class="button mode" href="${toggle}">${demo ? "Dùng dữ liệu Excel" : "Xem mô phỏng"}</a></div></header>
-    <div class="data-banner ${demo ? "demo" : ""}"><span><i></i><strong>${demo ? "Dữ liệu mô phỏng" : "Dữ liệu tạm từ Excel"}</strong></span><span>${demo ? "Dùng để xem thử giao diện và tương tác." : "DATA_LOOKER · " + rows.length + " hồ sơ · Ngày hiển thị " + dateLabel(today)}</span></div>
-    ${views[page]()}</div>
+    <div class="head-actions">${page === "report" ? '<button class="button" id="print">In / Lưu PDF</button>' : ""}<a class="button mode" href="${toggle}">${demo ? (live ? "Dùng dữ liệu Google Sheets" : "Dùng dữ liệu Excel") : "Xem mô phỏng"}</a></div></header>
+    <div class="data-banner ${demo ? "demo" : ""}"><span><i></i><strong>${demo ? "Dữ liệu mô phỏng" : sourceLabel}</strong></span><span>${demo ? "Dùng để xem thử giao diện và tương tác." : (live ? "DỮ LIỆU TỔNG HỢP · " : "DATA_LOOKER · ") + rows.length + " hồ sơ · " + (live ? "Đọc lúc " + escape(live.payload.loadedAt) : "Ngày hiển thị " + dateLabel(today))}</span></div>
+    ${dataNotes}${views[page]()}</div>
   </main>`;
 if (page === "btgpmb") setupList();
 if (page === "report")
